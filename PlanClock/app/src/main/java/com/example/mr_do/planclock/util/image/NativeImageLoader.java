@@ -7,10 +7,9 @@ import android.graphics.BitmapFactory;
 import android.os.Build;
 import android.os.Environment;
 import android.os.StatFs;
-import android.util.Log;
 import android.util.LruCache;
 
-import com.example.mr_do.clock.util.log.LogUtil;
+import com.example.mr_do.planclock.util.log.LogUtil;
 import com.jakewharton.disklrucache.DiskLruCache;
 
 import java.io.File;
