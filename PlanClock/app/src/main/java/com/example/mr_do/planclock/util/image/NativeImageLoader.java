@@ -16,6 +16,8 @@ import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
@@ -25,14 +27,40 @@ import java.security.NoSuchAlgorithmException;
  */
 
 public class NativeImageLoader implements IImageLoader {
+    private static final String MEMORY_TAG = "MemoryImageLoader";
+    private static final String DISK_TAG = "DiskImageLoader";
+    public interface IImageCache {
+        /**
+         * 用来存放缓存元素的类
+         * 因为缓存元素有可能不是Bitmap
+         */
+        class CacheElement{
+            private Bitmap bitmap;
+            private InputStream inputStream;
 
-    private interface IImageCache {
+            public Bitmap getBitmap() {
+                return bitmap;
+            }
+
+            public void setBitmap(Bitmap bitmap) {
+                this.bitmap = bitmap;
+            }
+
+            public InputStream getInputStream() {
+                return inputStream;
+            }
+
+            public void setInputStream(InputStream inputStream) {
+                this.inputStream = inputStream;
+            }
+        }
+
         /**
          * 放入缓存
          * @param url 用于取出图片的标志
-         * @param bitmap 要放入缓存的图片
+         * @param cacheElement 要放入缓存元素
          */
-        void put(String url, Bitmap bitmap);
+        void put(String url, CacheElement cacheElement) throws IOException;
 
         /**
          * 从缓存中取出
@@ -111,17 +139,14 @@ public class NativeImageLoader implements IImageLoader {
                     inSampleSize *= 2;
                 }
             }
-
             return inSampleSize;
         }
     }
 
     //图片缓存实现类,内存缓存
     private class MemoryCache implements IImageCache{
-        private Context mContext;
         private LruCache<String, Bitmap> mMemoryCache;
-        public MemoryCache(Context context){
-            mContext = context;
+        public MemoryCache(){
             final int maxMemory = (int)(Runtime.getRuntime().maxMemory()/1024);
             final int cacheSize = maxMemory/8;
             mMemoryCache = new LruCache<String, Bitmap>(cacheSize){
@@ -132,9 +157,9 @@ public class NativeImageLoader implements IImageLoader {
             };
         }
         @Override
-        public void put(String url, Bitmap bitmap) {
+        public void put(String url, CacheElement cacheElement) {
             if(mMemoryCache.get(url)==null){
-                mMemoryCache.put(url, bitmap);
+                mMemoryCache.put(url, cacheElement.getBitmap());
             }
         }
 
@@ -152,7 +177,12 @@ public class NativeImageLoader implements IImageLoader {
         private Context mContext;
         private File diskCacheDir;
         private IImageResizer mImageResizer;
-        private boolean mIsDiskLruCacheCreated;
+        private boolean mIsDiskLruCacheCreated = false;
+
+        public boolean ismIsDiskLruCacheCreated(){
+            return mIsDiskLruCacheCreated;
+        }
+
         public DiskCache(Context context){
             mContext = context;
             mImageResizer = new NativeImageResizer();
@@ -170,18 +200,42 @@ public class NativeImageLoader implements IImageLoader {
             }
         }
 
-        public void init(String url){
-
-        }
-
         @Override
-        public void put(String url, Bitmap bitmap) {
-
+        public void put(String url, CacheElement cacheElement) {
+            String key = hashKeyFormUrl(url);
+            DiskLruCache.Editor editor = null;
+            try {
+                editor = mDiskLruCache.edit(key);
+                if(editor != null){
+                    OutputStream outputStream = editor.newOutputStream(DISK_CACHE_INDEX);
+                   if( writeToStream(cacheElement.getInputStream(), outputStream)){
+                       editor.commit();
+                   }else{
+                       editor.abort();
+                   }
+                   mDiskLruCache.flush();
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
 
-        public void cancel(){
-
+        private boolean writeToStream(InputStream inputStream,OutputStream outputStream) throws IOException {
+            try {
+                int b;
+                while ((b=inputStream.read())!=-1){
+                    outputStream.write(b);
+                }
+                return true;
+            } catch (IOException e) {
+                e.printStackTrace();
+                return false;
+            }finally {
+                inputStream.close();
+                outputStream.close();
+            }
         }
+
 
         @Override
         public Bitmap get(String url, int reqWidth, int reqHeight) throws IOException {
@@ -247,28 +301,57 @@ public class NativeImageLoader implements IImageLoader {
 
     //图片缓存实现类,双缓存
     private class DoubleCache implements IImageCache{
-        private DiskLruCache mDiskLruCache;
+        private DiskCache mDiskCache;
+        private MemoryCache mMemoryCache;
         private Context mContext;
 
+        //缓存策咯：
+        //从网络加载图片，先放到disk上
+        //当下次从disk上取图片时，放入内存中
+        //本来是下载图片后就放入disk和memory中
+        //但是需要先下载到disk才能实现压缩图片的功能
         public DoubleCache(Context context){
             mContext = context;
-            final int maxMemory = (int)(Runtime.getRuntime().maxMemory()/1024);
-            final int cacheSize = maxMemory/8;
-
+            mMemoryCache = new MemoryCache();
+            mDiskCache = new DiskCache(mContext);
         }
 
         @Override
-        public void put(String url, Bitmap bitmap) {
-
+        public void put(String url, CacheElement cacheElement) {
+            if(mDiskCache.ismIsDiskLruCacheCreated()){
+                mDiskCache.put(url, cacheElement);
+            }
         }
 
         @Override
         public Bitmap get(String url, int reqWidth, int reqHeight) {
+            Bitmap bitmap = mMemoryCache.get(url, reqWidth, reqHeight);
+            if(bitmap!=null){
+                LogUtil.logI(MEMORY_TAG, url);
+                return bitmap;
+            }
 
+            try {
+                bitmap = mDiskCache.get(url,reqWidth,reqHeight);
+                if(bitmap!=null){
+                    LogUtil.logI(DISK_TAG, url);
+
+                    CacheElement cacheElement = new CacheElement();
+                    cacheElement.setBitmap(bitmap);
+                    mMemoryCache.put(url,cacheElement);
+                    return bitmap;
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
             return null;
         }
     }
 
+    private IImageCache mImageCache = null;
+    public void setmImageCache(IImageCache imageCache){
+        mImageCache = imageCache;
+    }
     private NativeImageLoader(){
 
     }
