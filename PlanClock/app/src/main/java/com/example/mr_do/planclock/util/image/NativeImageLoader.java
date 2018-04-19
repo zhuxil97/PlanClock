@@ -6,20 +6,34 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.os.Build;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Message;
 import android.os.StatFs;
+import android.support.annotation.NonNull;
 import android.util.LruCache;
-
+import com.example.mr_do.planclock.R;
+import com.example.mr_do.planclock.util.IOUtil;
 import com.example.mr_do.planclock.util.log.LogUtil;
 import com.jakewharton.disklrucache.DiskLruCache;
-
+import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Created by Mr_Do on 2018/4/4.
@@ -27,9 +41,8 @@ import java.security.NoSuchAlgorithmException;
  */
 
 public class NativeImageLoader implements IImageLoader {
-    private static final String MEMORY_TAG = "MemoryImageLoader";
-    private static final String DISK_TAG = "DiskImageLoader";
-    public interface IImageCache {
+
+    private interface IImageCache {
         /**
          * 用来存放缓存元素的类
          * 因为缓存元素有可能不是Bitmap
@@ -60,16 +73,17 @@ public class NativeImageLoader implements IImageLoader {
          * @param url 用于取出图片的标志
          * @param cacheElement 要放入缓存元素
          */
-        void put(String url, CacheElement cacheElement) throws IOException;
+        void put(String url, CacheElement cacheElement);
 
         /**
          * 从缓存中取出
          * @param url 图片的标志,这里建议用url进行标志
          */
-        Bitmap get(String url, int reqWidth, int reqHeight) throws IOException;
+        Bitmap get(String url, int reqWidth, int reqHeight);
     }
 
     private interface IImageResizer {
+
         /**
          * 压缩Resource中的图片,
          * 如果需要的宽度或者高度为0,则说明不压缩
@@ -97,8 +111,13 @@ public class NativeImageLoader implements IImageLoader {
                                                      int reqHeight);
     }
 
+    private interface ILoadStrategy{
+        void loadToView(String uri, int reqWidth, int reqHeight, ShowView showView);
+    }
+
     //图片压缩内部类
-    private class NativeImageResizer implements IImageResizer {
+    private static class NativeImageResizer implements IImageResizer {
+
         @Override
         public Bitmap decodeSampledBitmapFromResource(Resources res, int resId, int reqWidth, int reqHeight) {
             final BitmapFactory.Options options = new BitmapFactory.Options();
@@ -144,7 +163,7 @@ public class NativeImageLoader implements IImageLoader {
     }
 
     //图片缓存实现类,内存缓存
-    private class MemoryCache implements IImageCache{
+    private static class MemoryCache implements IImageCache{
         private LruCache<String, Bitmap> mMemoryCache;
         public MemoryCache(){
             final int maxMemory = (int)(Runtime.getRuntime().maxMemory()/1024);
@@ -158,7 +177,7 @@ public class NativeImageLoader implements IImageLoader {
         }
         @Override
         public void put(String url, CacheElement cacheElement) {
-            if(mMemoryCache.get(url)==null){
+            if(mMemoryCache.get(url)==null&&url!=null&&cacheElement.getBitmap()!=null){
                 mMemoryCache.put(url, cacheElement.getBitmap());
             }
         }
@@ -170,7 +189,7 @@ public class NativeImageLoader implements IImageLoader {
     }
 
     //图片缓存实现类,磁盘缓存
-    private class DiskCache implements IImageCache{
+    private static class DiskCache implements IImageCache{
         private static final long DISK_CACHE_SIZE = 1024*1024*50;
         private static final int DISK_CACHE_INDEX = 0;
         private DiskLruCache mDiskLruCache;
@@ -202,21 +221,26 @@ public class NativeImageLoader implements IImageLoader {
 
         @Override
         public void put(String url, CacheElement cacheElement) {
+            if(Looper.myLooper() == Looper.getMainLooper())
+                throw new RuntimeException("can not visit disk from UI Thread");
             String key = hashKeyFormUrl(url);
+            OutputStream outputStream = null;
             DiskLruCache.Editor editor = null;
             try {
                 editor = mDiskLruCache.edit(key);
                 if(editor != null){
-                    OutputStream outputStream = editor.newOutputStream(DISK_CACHE_INDEX);
-                   if( writeToStream(cacheElement.getInputStream(), outputStream)){
-                       editor.commit();
-                   }else{
-                       editor.abort();
-                   }
-                   mDiskLruCache.flush();
+                    outputStream = editor.newOutputStream(DISK_CACHE_INDEX);
+                    if( writeToStream(cacheElement.getInputStream(), outputStream)){
+                        editor.commit();
+                    }else{
+                        editor.abort();
+                    }
+                    mDiskLruCache.flush();
                 }
             } catch (IOException e) {
                 e.printStackTrace();
+            }finally {
+                IOUtil.close(outputStream);
             }
         }
 
@@ -231,23 +255,29 @@ public class NativeImageLoader implements IImageLoader {
                 e.printStackTrace();
                 return false;
             }finally {
-                inputStream.close();
-                outputStream.close();
+                IOUtil.close(inputStream);
+                IOUtil.close(outputStream);
             }
         }
 
 
         @Override
-        public Bitmap get(String url, int reqWidth, int reqHeight) throws IOException {
+        public Bitmap get(String url, int reqWidth, int reqHeight) {
+            if(Looper.myLooper() == Looper.getMainLooper())
+                throw new RuntimeException("can not visit disk from UI Thread");
             if(mDiskLruCache == null)
                 return null;
             Bitmap bitmap = null;
             String key = hashKeyFormUrl(url);
-            DiskLruCache.Snapshot snapshot = mDiskLruCache.get(key);
-            if(snapshot != null){
-                FileInputStream fileInputStream = (FileInputStream) snapshot.getInputStream(DISK_CACHE_INDEX);
-                FileDescriptor fileDescriptor = fileInputStream.getFD();
-                bitmap = mImageResizer.decodeSampledBitmapFromFileDescriptor(fileDescriptor, reqWidth, reqHeight);
+            try {
+                DiskLruCache.Snapshot snapshot = mDiskLruCache.get(key);
+                if (snapshot != null) {
+                    FileInputStream fileInputStream = (FileInputStream) snapshot.getInputStream(DISK_CACHE_INDEX);
+                    FileDescriptor fileDescriptor = fileInputStream.getFD();
+                    bitmap = mImageResizer.decodeSampledBitmapFromFileDescriptor(fileDescriptor, reqWidth, reqHeight);
+                }
+            }catch (IOException e){
+                e.printStackTrace();
             }
             return bitmap;
         }
@@ -281,8 +311,6 @@ public class NativeImageLoader implements IImageLoader {
             } catch (NoSuchAlgorithmException e) {
                 cacheKey = String.valueOf(url.hashCode());
             }
-            LogUtil.logI("URL: ",url);
-            LogUtil.logI("CacheKey", cacheKey);
             return  cacheKey;
         }
 
@@ -292,75 +320,172 @@ public class NativeImageLoader implements IImageLoader {
                 String hex = Integer.toHexString(0xFF & digest[i]);
                 if(hex.length() == 1){
                     sb.append('0');
-                    sb.append(hex);
                 }
+                sb.append(hex);
             }
             return sb.toString();
         }
     }
 
-    //图片缓存实现类,双缓存
-    private class DoubleCache implements IImageCache{
-        private DiskCache mDiskCache;
-        private MemoryCache mMemoryCache;
+    //双缓存加载策略
+    private static class DoubleCacheStrategy implements ILoadStrategy{
+        private IImageResizer iImageResizer = new NativeImageResizer();
+        private IImageCache mDiskCache;
+        private IImageCache mMemoryCache;
         private Context mContext;
+        private static final String MEMORY_TAG = "Memory_ImageLoader";
+        private static final String DISK_TAG = "Disk_ImageLoader";
+        private static final String WEB_TAG = "Web_ImageLoader";
+        private static final String LOAD_TAG = "_ImageLoader";
+        public static final int MESSAGE_POST_RESULT = 1;
+        private static final int CPU_COUNT = Runtime.getRuntime().availableProcessors();
+        private static final int CORE_POOL_SIZE = CPU_COUNT+1;
+        private static final int MAXIMUM_POOL_SIZE = CPU_COUNT*2+1;
+        private static final long KEEP_ALIVE = 10L;
+        private static final int IO_BUFFER_SIZE = 8*1024;
+        private static final MyBlockingDeque MY_BLOCKING_DEQUE = new MyBlockingDeque();
+        private static final ThreadFactory sThreadFactory = new ThreadFactory() {
+            private final AtomicInteger mCount = new AtomicInteger(1);
+            @Override
+            public Thread newThread(@NonNull Runnable runnable) {
+                return new Thread(runnable, "ImageLoader#"+mCount.getAndIncrement());
+            }
+        };
+        public static final Executor THREAD_POOL_EXECUTOR = new ThreadPoolExecutor(
+                CORE_POOL_SIZE, MAXIMUM_POOL_SIZE, KEEP_ALIVE, TimeUnit.SECONDS,
+                MY_BLOCKING_DEQUE, sThreadFactory
+        );
 
-        //缓存策咯：
-        //从网络加载图片，先放到disk上
-        //当下次从disk上取图片时，放入内存中
-        //本来是下载图片后就放入disk和memory中
-        //但是需要先下载到disk才能实现压缩图片的功能
-        public DoubleCache(Context context){
-            mContext = context;
-            mMemoryCache = new MemoryCache();
-            mDiskCache = new DiskCache(mContext);
-        }
+        //变成可以通过uri来判定是否相等的runnable
+        private static class MyRunnable implements Runnable{
+            private String uri = null;
 
-        @Override
-        public void put(String url, CacheElement cacheElement) {
-            if(mDiskCache.ismIsDiskLruCacheCreated()){
-                mDiskCache.put(url, cacheElement);
+            public MyRunnable(String uri){
+                this.uri = uri;
+            }
+
+            @Override
+            public void run() {
+
+            }
+
+            @Override
+            public boolean equals(Object obj) {
+                if(obj instanceof MyRunnable)
+                    return ((MyRunnable)obj).uri==uri;
+                else
+                    return false;
             }
         }
 
-        @Override
-        public Bitmap get(String url, int reqWidth, int reqHeight) {
-            Bitmap bitmap = mMemoryCache.get(url, reqWidth, reqHeight);
-            if(bitmap!=null){
-                LogUtil.logI(MEMORY_TAG, url);
-                return bitmap;
-            }
-
-            try {
-                bitmap = mDiskCache.get(url,reqWidth,reqHeight);
-                if(bitmap!=null){
-                    LogUtil.logI(DISK_TAG, url);
-
-                    CacheElement cacheElement = new CacheElement();
-                    cacheElement.setBitmap(bitmap);
-                    mMemoryCache.put(url,cacheElement);
-                    return bitmap;
+        //变成了一个栈
+        private static class MyBlockingDeque extends LinkedBlockingDeque<Runnable>{
+            @Override
+            public boolean offer(Runnable runnable) {
+                if(contains(runnable)){
+                    return true;
                 }
-            } catch (IOException e) {
-                e.printStackTrace();
+                return super.offerFirst(runnable);
             }
-            return null;
+        }
+
+        private class LoadResult{
+            public LoadResult(ShowView view, Bitmap bitmap, String tag) {
+                this.view = view;
+                this.bitmap = bitmap;
+                this.tag = tag;
+            }
+            public ShowView view;
+            public Bitmap bitmap;
+            public String tag;
+        }
+        private Handler mMainHandler = new Handler(Looper.getMainLooper()){
+            @Override
+            public void handleMessage(Message msg) {
+                LoadResult loadResult = (LoadResult) msg.obj;
+                String uri = loadResult.tag;
+                if(uri.equals(loadResult.view.getViewTag(R.id.image_loader_uri))){
+                    loadResult.view.bindView(loadResult.bitmap);
+                }
+                IImageCache.CacheElement cacheElement = new IImageCache.CacheElement();
+                cacheElement.setBitmap(loadResult.bitmap);
+                mMemoryCache.put(uri,cacheElement);
+            }
+        };
+
+        public DoubleCacheStrategy(Context context){
+            mContext = context;
+            mDiskCache = new DiskCache(mContext);
+            mMemoryCache = new MemoryCache();
+        }
+        @Override
+        public void loadToView(final String uri, final int reqWidth, final int reqHeight, final ShowView showView) {
+            Bitmap bitmap = mMemoryCache.get(uri,reqWidth,reqHeight);
+            if(bitmap!=null) {
+                if(uri.equals(showView.getViewTag(R.id.image_loader_uri))){
+                    showView.bindView(bitmap);
+                }
+                return;
+            }
+            Runnable loadBitmapTask = new MyRunnable(uri) {
+                @Override
+                public void run() {
+                    Bitmap bitmap = null;
+                    LogUtil.logE("COMPARE_URI_",uri);
+                    try {
+                        bitmap = mDiskCache.get(uri, reqWidth, reqHeight);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                    if(bitmap != null) {
+                        LoadResult result = new LoadResult(showView, bitmap,uri);
+                        mMainHandler.obtainMessage(MESSAGE_POST_RESULT, result).sendToTarget();
+                        return;
+                    }
+                    HttpURLConnection httpURLConnection = null;
+                    InputStream is = null;
+                    LoadResult result = null;
+                    BufferedInputStream in = null;
+                    try {
+                        final URL url = new URL(uri);
+                        httpURLConnection = (HttpURLConnection)url.openConnection();
+                        is = httpURLConnection.getInputStream();
+                        in = new BufferedInputStream(is, IO_BUFFER_SIZE);
+                        IImageCache.CacheElement cacheElement = new IImageCache.CacheElement();
+                        cacheElement.setInputStream(in);
+                        mDiskCache.put(uri, cacheElement);
+                        bitmap = mDiskCache.get(uri, reqWidth, reqHeight);
+                        cacheElement.setBitmap(bitmap);
+                        result = new LoadResult(showView, bitmap, uri);
+                        mMainHandler.obtainMessage(MESSAGE_POST_RESULT, result).sendToTarget();
+                    } catch (MalformedURLException e) {
+                        e.printStackTrace();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    } finally {
+                        if(httpURLConnection != null)
+                            httpURLConnection.disconnect();
+                        IOUtil.close(in);
+                    }
+                }
+            };
+            THREAD_POOL_EXECUTOR.execute(loadBitmapTask);
+            LogUtil.logE("SOURCE_URI_",uri);
         }
     }
-
-    private IImageCache mImageCache = null;
-    public void setmImageCache(IImageCache imageCache){
-        mImageCache = imageCache;
-    }
-    private NativeImageLoader(){
-
-    }
+    private static Context sContext;
+    private static ILoadStrategy sStrategy;
+    private NativeImageLoader(){}
 
     /**
      * 单例模式
      * @return 返回一个ImageLoader单例
      */
-    public static NativeImageLoader getImageLoader(){
+    public static NativeImageLoader getImageLoader(@NonNull Context context){
+        sContext = context;
+        sStrategy = new DoubleCacheStrategy(sContext);
         return SingletonHolder.imageLoader;
     }
 
@@ -372,12 +497,12 @@ public class NativeImageLoader implements IImageLoader {
     }
 
     @Override
-    public Bitmap synLoadImage() {
-        return null;
+    public void asyncLoadImageFromWeb(final String uri, final int reqWidth, final int reqHeight, final ShowView showView) throws Exception {
+        sStrategy.loadToView(uri,reqWidth,reqHeight,showView);
     }
 
     @Override
-    public Bitmap asyncLoadImage() {
-        return null;
+    public void asyncLoadImageFromDisk(String uri, int reqWidth, int reqHeight, ShowView showView) {
+
     }
 }

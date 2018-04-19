@@ -1,6 +1,7 @@
 package com.example.mr_do.planclock.util.image;
 
 import android.graphics.Bitmap;
+import android.widget.ImageView;
 
 /**
  * Created by Mr_Do on 2018/4/4.
@@ -8,15 +9,28 @@ import android.graphics.Bitmap;
  */
 
 public interface IImageLoader {
+    interface ShowView{
+        String getViewTag(int key);
+        void setViewTag(int key, String value);
+        void bindView(Bitmap bitmap);
+
+    }
     /**
-     * 同步加载图片
-     * @return 返回图片
+     * 异步从网络加载图片到view上
+     * @param uri 图片地址
+     * @param reqWidth 需要的宽度
+     * @param reqHeight 需要的高度
+     * @param showView 要绑定的view
      */
-    Bitmap synLoadImage();
+    void asyncLoadImageFromWeb(String uri, int reqWidth, int reqHeight, ShowView showView) throws Exception;
+
 
     /**
-     * 异步加载图片
-     * @return 返回图片
+     * 异步从磁盘加载图片到view上
+     * @param uri 图片地址
+     * @param reqWidth 需要的宽度
+     * @param reqHeight 需要的高度
+     * @param showView 要绑定的view
      */
-    Bitmap asyncLoadImage();
+    void asyncLoadImageFromDisk(String uri, int reqWidth, int reqHeight, ShowView showView);
 }
